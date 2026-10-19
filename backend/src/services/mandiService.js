@@ -1,8 +1,6 @@
-
 import { env } from "../config/env.js";
-import { AppError } from "../utils/AppError.js";
 import { getCached, setCached } from "../utils/cache.js";
-import { getWithRetry } from "../utils/httpClient.js";
+import { httpClient } from "../utils/httpClient.js";
 import { toNumber, uniqueSorted } from "../utils/numbers.js";
 
 const DATASET_ID = "9ef84268-d588-465a-a308-a864a43d0070";
@@ -60,19 +58,15 @@ export function parseArrivalDate(value) {
 
   const text = String(value).trim();
 
-  // Handle ISO dates and ISO timestamps.
-  if (
-    /^\d{4}-\d{1,2}-\d{1,2}(?:$|T|\s)/.test(text)
-  ) {
-    const isoDate = new Date(text);
+  // Handle ISO dates and timestamps.
+  if (/^\d{4}-\d{1,2}-\d{1,2}(?:$|T|\s)/.test(text)) {
+    const date = new Date(text);
 
-    return Number.isNaN(isoDate.getTime()) ? null : isoDate;
+    return Number.isNaN(date.getTime()) ? null : date;
   }
 
-  // Handle DD/MM/YYYY, DD-MM-YYYY, and two-digit years.
-  const match = text.match(
-    /^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/,
-  );
+  // Handle DD/MM/YYYY and DD-MM-YYYY.
+  const match = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
 
   if (match) {
     const day = Number(match[1]);
@@ -101,7 +95,6 @@ export function parseArrivalDate(value) {
     return date;
   }
 
-  // Handle other parseable date formats.
   const timestamp = Date.parse(text);
 
   return Number.isNaN(timestamp) ? null : new Date(timestamp);
@@ -143,7 +136,7 @@ export function normalizeRecord(record) {
 
   const parsedDate = parseArrivalDate(arrivalRaw);
 
-  // Skip records that do not contain any usable price.
+  // Skip records without any usable price.
   if (modalPrice === null && minPrice === null && maxPrice === null) {
     return null;
   }
@@ -165,74 +158,9 @@ export function normalizeRecord(record) {
   };
 }
 
-function mapExternalError(error) {
-  const status = error.response?.status;
-  const code = error.code || "UNKNOWN_ERROR";
-  const body = error.response?.data;
-
-  const apiMessage =
-    (typeof body === "string" && body) ||
-    body?.message ||
-    body?.error ||
-    error.message ||
-    "Unknown upstream error";
-
-  // Never log request URLs or query parameters because they may
-  // contain the API key.
-  console.error("[Mandi API] Upstream request failed", {
-    hostname: "api.data.gov.in",
-    code,
-    status: status ?? null,
-    message: String(error.message || "Unknown error").slice(0, 200),
-  });
-
-  if (
-    status === 401 ||
-    status === 403 ||
-    /api[\s_-]*key/i.test(String(apiMessage))
-  ) {
-    throw new AppError(
-      502,
-      "data.gov.in rejected the API key. Check DATA_GOV_IN_API_KEY.",
-    );
-  }
-
-  if (status === 429) {
-    throw new AppError(
-      429,
-      "data.gov.in rate limit reached. Please wait and retry.",
-    );
-  }
-
-  if (code === "ECONNABORTED" || code === "ETIMEDOUT") {
-    throw new AppError(504, "The mandi price API request timed out.");
-  }
-
-  if (
-    code === "ECONNREFUSED" ||
-    code === "ECONNRESET" ||
-    code === "ENOTFOUND" ||
-    code === "EAI_AGAIN"
-  ) {
-    throw new AppError(
-      502,
-      "Could not connect to the data.gov.in mandi price service. Please retry later.",
-    );
-  }
-
-  // Do not expose raw upstream responses or internal network details.
-  throw new AppError(
-    502,
-    "Unable to fetch mandi prices from data.gov.in.",
-  );
-}
-
 export async function fetchMandiDataset(filters = {}, options = {}) {
   if (!env.dataGovApiKey) {
-    throw new AppError(
-      500,
-      "DATA_GOV_IN_API_KEY is not configured on the backend.",
-    );
+    throw new Error("DATA_GOV_IN_API_KEY is not configured.");
   }
 
   const requestedLimit = Number(options.limit);
@@ -268,8 +196,6 @@ export async function fetchMandiDataset(filters = {}, options = {}) {
     };
   }
 
-  // Keep the official resource endpoint and pass query parameters
-  // separately through Axios.
   const params = {
     "api-key": env.dataGovApiKey,
     format: "json",
@@ -284,7 +210,7 @@ export async function fetchMandiDataset(filters = {}, options = {}) {
   });
 
   try {
-    const response = await getWithRetry(DATASET_URL, { params });
+    const response = await httpClient.get(DATASET_URL, { params });
     const payload = response.data || {};
 
     const records = Array.isArray(payload.records)
@@ -304,11 +230,8 @@ export async function fetchMandiDataset(filters = {}, options = {}) {
 
     return setCached(cacheKey, result, env.mandiCacheTtlMs);
   } catch (error) {
-    if (error instanceof AppError) {
-      throw error;
-    }
-
-    mapExternalError(error);
+    console.error("Error fetching mandi data:", error.message);
+    throw new Error("Unable to fetch mandi data. Please try again later.");
   }
 }
 
@@ -442,9 +365,7 @@ export function summarizeRecords(records) {
     latest.modalPrice !== null &&
     previous.modalPrice !== null
   ) {
-    const amount = roundSafe(
-      latest.modalPrice - previous.modalPrice,
-    );
+    const amount = roundSafe(latest.modalPrice - previous.modalPrice);
 
     const percent = previous.modalPrice
       ? roundSafe((amount / previous.modalPrice) * 100)
